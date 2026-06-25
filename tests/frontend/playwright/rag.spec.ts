@@ -1,6 +1,16 @@
 import { test, expect } from '@playwright/test';
 
-test.skip('rag page renders cited answer', async ({ page }) => {
-  // TODO (Frontend lead): implement against the running stack;
-  // verify [N]-style citation markers render in the response.
+test('rag page renders cited answer', async ({ page }) => {
+  await page.goto('/rag');
+
+  await page.locator('input').fill('How do I prep ginger for stir-fry?');
+  await page.getByRole('button', { name: /Ask/i }).click();
+
+  await expect(
+    page.locator('[data-testid="rag-answer"]')
+  ).toBeVisible({ timeout: 30_000 });
+
+  await expect(
+    page.locator('[data-testid="citation-marker"]').first()
+  ).toBeVisible({ timeout: 30_000 });
 });
