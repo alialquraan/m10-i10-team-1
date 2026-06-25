@@ -11,11 +11,12 @@ Discipline gates the autograder enforces:
 - `/healthz` does NOT touch Neo4j or Weaviate.
 """
 import os
+import asyncio  
 from contextlib import asynccontextmanager
 
 import spacy
 import weaviate
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
@@ -42,24 +43,23 @@ from .w9b_mapper.shapes import SUPPORTED_PATTERNS
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.neo4j_driver = GraphDatabase.driver(
-        os.environ["NEO4J_URI"],
-        auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]),
+        os.environ.get("NEO4J_URI", "bolt://neo4j:7687"),
+        auth=(os.environ.get("NEO4J_USER", "neo4j"), os.environ.get("NEO4J_PASSWORD", "password")),
     )
-    app.state.weaviate_client = weaviate.Client(os.environ["WEAVIATE_URL"])
+    app.state.weaviate_client = weaviate.Client(os.environ.get("WEAVIATE_URL", "http://weaviate:8080"))
     app.state.nlp = spacy.load("en_core_web_sm")
     app.state.generator = load_generator()
-    # Same sentence-transformers model the seed used at ingest. The
-    # Weaviate class is `vectorizer=none`, so /rag/answer encodes the
-    # query externally and queries via `with_near_vector`.
     app.state.embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     yield
     app.state.neo4j_driver.close()
 
 
 app = FastAPI(title="M10 Recipe Service", lifespan=lifespan)
+
+WEB_ORIGIN = os.environ.get("WEB_ORIGIN", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.environ.get("WEB_ORIGIN", "http://localhost:3000")],
+    allow_origins=[WEB_ORIGIN],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,7 +68,13 @@ app.add_middleware(
 
 @app.post("/extract", response_model=ExtractResponse)
 def extract(req: ExtractRequest, nlp=Depends(get_nlp)) -> ExtractResponse:
-    return ExtractResponse(entities=extract_entities(req.text, nlp))
+    try:
+        return ExtractResponse(entities=extract_entities(req.text, nlp))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Extraction failure: {str(exc)}"
+        )
 
 
 @app.post("/kg/query", response_model=KGResponse)
@@ -77,14 +83,21 @@ def kg_query(req: KGRequest, session=Depends(get_session)) -> KGResponse:
         cypher, params = wrap_kg_query(req.question)
     except UnsupportedQueryError:
         raise HTTPException(
-            status_code=422,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=UnsupportedQueryDetail(
                 reason="unsupported_question",
                 supported_patterns=list(SUPPORTED_PATTERNS),
             ).model_dump(),
         )
-    rows = [r.data() for r in session.run(cypher, **params)]
-    return KGResponse(cypher=cypher, rows=rows, count=len(rows))
+    
+    try:
+        rows = [r.data() for r in session.run(cypher, **params)]
+        return KGResponse(cypher=cypher, rows=rows, count=len(rows))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Knowledge Graph execution error: {str(exc)}"
+        )
 
 
 @app.post("/rag/answer", response_model=RAGResponse)
@@ -94,8 +107,14 @@ def rag_answer(
     generator=Depends(get_generator),
     embedder=Depends(get_embedder),
 ) -> RAGResponse:
-    result = compose_rag(req.question, embedder, weaviate_client, generator, k=req.k)
-    return RAGResponse(**result)
+    try:
+        result = compose_rag(req.question, embedder, weaviate_client, generator, k=req.k)
+        return RAGResponse(**result)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"RAG processing failure: {str(exc)}"
+        )
 
 
 @app.get("/healthz", response_model=HealthResponse)
@@ -104,24 +123,44 @@ def healthz() -> HealthResponse:
 
 
 @app.get("/readyz")
-def readyz(
+async def readyz(
     session=Depends(get_session),
     weaviate_client=Depends(get_weaviate),
 ):
     detail = {"neo4j": "unknown", "weaviate": "unknown"}
-    try:
+    
+    def check_neo4j():
         session.run("RETURN 1").single()
+        
+    def check_weaviate():
+        return weaviate_client.is_ready()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(check_neo4j), 
+            timeout=2.0
+        )
         detail["neo4j"] = "ok"
+    except asyncio.TimeoutError:
+        detail["neo4j"] = "unavailable: timeout after 2 seconds"
     except Exception as exc:
         detail["neo4j"] = f"unavailable: {exc.__class__.__name__}"
+
     try:
-        if weaviate_client.is_ready():
+        is_weaviate_ready = await asyncio.wait_for(
+            asyncio.to_thread(check_weaviate), 
+            timeout=2.0
+        )
+        if is_weaviate_ready:
             detail["weaviate"] = "ok"
         else:
             detail["weaviate"] = "not ready"
+    except asyncio.TimeoutError:
+        detail["weaviate"] = "unavailable: timeout after 2 seconds"
     except Exception as exc:
         detail["weaviate"] = f"unavailable: {exc.__class__.__name__}"
 
     if detail["neo4j"] != "ok" or detail["weaviate"] != "ok":
-        raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
+        
     return detail
