@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings — CRLF breaks them inside Linux containers.
+*.sh text eol=lf
+# YAML and Dockerfiles: keep LF for cross-platform consistency.
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
